@@ -2,8 +2,9 @@
 """
 The World in One Day — Sunday 22 November 2026
 Broadsheet card-grid renderer strictly implementing /root/makefun/ni/v3/SPEC.md.
-Pure Python + Pillow (no external images, no generative models).
-Canvas: 4000x4000 (all logical 1000x1000 SPEC px dimensions scaled x4).
+Pure Python + Pillow (no external images, no generative models, no network).
+Canvas: 1024x1024 native 1:1 px (all SPEC px dimensions applied directly, no scaling).
+Gate constraints: entry.png <= 1024x1024 px, <= 1 MiB (1,048,576 bytes), byte-deterministic.
 """
 
 from __future__ import annotations
@@ -13,19 +14,16 @@ import math
 import os
 from collections import Counter
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
 # ---------------------------------------------------------------------------
-# Scale & Canvas Constants (SPEC 1000x1000 logical -> 4000x4000 physical)
+# Canvas & Gate Constants (1024x1024 native, <= 1 MiB hard cap)
 # ---------------------------------------------------------------------------
-SCALE = 4
-LOGICAL_W = 1000
-LOGICAL_H = 1000
-CANVAS_W = LOGICAL_W * SCALE  # 4000
-CANVAS_H = LOGICAL_H * SCALE  # 4000
-MAX_PNG_BYTES = 8 * 1024 * 1024  # 8 MB cap per SPEC
+CANVAS_W = 1024
+CANVAS_H = 1024
+MAX_PNG_BYTES = 1024 * 1024  # 1,048,576 bytes (1 MiB) hard gate limit
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_MAIN = os.path.join(SCRIPT_DIR, "entry.png")
@@ -54,11 +52,6 @@ def load_font(path: str, size_px: int) -> ImageFont.FreeTypeFont:
         f = ImageFont.truetype(path, int(size_px))
         _FONT_CACHE[key] = f
     return f
-
-
-def sx(val: float) -> int:
-    """Scale logical SPEC px to physical 4000x4000 px."""
-    return int(round(val * SCALE))
 
 
 # ---------------------------------------------------------------------------
@@ -279,12 +272,12 @@ def fit(
     max_lines: int,
     max_h: Optional[int] = None,
     line_spacing: float = 1.12,
-    min_logical_px: int = 8,
+    min_px: int = 8,
 ) -> Tuple[ImageFont.FreeTypeFont, List[str], int, int]:
     """
     SPEC-enforced fit(text, font, max_w, max_lines):
     Measures bounding box; if overflowing max_w / max_lines / max_h, shrinks
-    font size step by step (-1px per step, floor 8px logical = 8*SCALE physical).
+    font size step by step (-1px per step, floor 8px).
     Raises ValueError if still overflowing at floor.
     Returns (fitted_font, lines, line_step_px, total_ink_h).
     """
@@ -292,9 +285,8 @@ def fit(
     if not font_path:
         raise ValueError("fit() requires a TrueType/OpenType FreeTypeFont")
     start_size = int(round(font.size))
-    min_size = min_logical_px * SCALE
 
-    for size in range(start_size, min_size - 1, -1):
+    for size in range(start_size, min_px - 1, -1):
         cand_font = load_font(font_path, size)
         if max_lines == 1:
             lines = [text]
@@ -322,7 +314,7 @@ def fit(
 
     raise ValueError(
         f"fit() failed: text={text!r} cannot fit in max_w={max_w}, "
-        f"max_lines={max_lines}, max_h={max_h} even at min size {min_size}px"
+        f"max_lines={max_lines}, max_h={max_h} even at min size {min_px}px"
     )
 
 
@@ -372,11 +364,15 @@ def draw_fitted_text(
     box_h: Optional[int] = None,
     line_spacing: float = 1.12,
     register: bool = True,
+    font_log: Optional[List[Tuple[str, int, int, int]]] = None,
 ) -> Tuple[int, int, int, int]:
     """Fit text via fit(), render crisp lines, and register exact rendered bbox."""
+    req_size = int(round(font.size))
     fitted_font, lines, step, _ = fit(
         text, font, max_w=max_w, max_lines=max_lines, max_h=box_h, line_spacing=line_spacing
     )
+    if font_log is not None:
+        font_log.append((label, req_size, int(round(fitted_font.size)), len(lines)))
 
     # Measure combined ink bbox relative to y=0 for accurate vertical alignment
     rel_bboxes = [draw.textbbox((0, i * step), ln, font=fitted_font) for i, ln in enumerate(lines)]
@@ -416,20 +412,20 @@ def draw_fitted_text(
 
 
 # ---------------------------------------------------------------------------
-# Bespoke Card Line-Art Illustrations (2px logical = 8px line, NO faces)
+# Bespoke Card Line-Art Illustrations (2px native line, NO faces)
 # ---------------------------------------------------------------------------
 def _draw_wave(
     draw: ImageDraw.ImageDraw,
     x0: int,
     x1: int,
     y: int,
-    amp: int,
+    amp: float,
     cycles: float,
     color: Tuple[int, int, int],
     width: int,
 ) -> None:
     pts = []
-    steps = 48
+    steps = 36
     for i in range(steps + 1):
         t = i / steps
         px = x0 + (x1 - x0) * t
@@ -445,7 +441,7 @@ def draw_card_illustration(
     accent: Tuple[int, int, int],
 ) -> None:
     """
-    Draw a clean editorial line-art vignette (2px logical = 8px stroke, zero faces)
+    Draw a clean editorial line-art vignette (2px primary stroke, 1px detail, zero faces)
     tailored to each of stories 1..12 inside rect=(x0, y0, x1, y1).
     """
     x0, y0, x1, y1 = rect
@@ -453,19 +449,19 @@ def draw_card_illustration(
     h = y1 - y0
     cx = (x0 + x1) // 2
     cy = (y0 + y1) // 2
-    lw = sx(2)          # 2px logical -> 8px physical
-    lw_thin = sx(1.25)  # 5px secondary detail
+    lw = 2       # 2px SPEC line width
+    lw_thin = 1  # 1px secondary detail
     soft_accent = tint(accent, 0.72)
     mid_accent = tint(accent, 0.42)
     ink = INK_BLACK
 
     # Panel background + hairline frame
-    draw.rectangle(rect, fill=ILLUS_BG, outline=CARD_BORDER, width=sx(1))
+    draw.rectangle(rect, fill=ILLUS_BG, outline=CARD_BORDER, width=1)
     # Subtle geometric wash band in accent tint
-    draw.rectangle((x0 + sx(2), y0 + sx(2), x1 - sx(2), y0 + int(h * 0.34)), fill=soft_accent)
+    draw.rectangle((x0 + 2, y0 + 2, x1 - 2, y0 + int(h * 0.34)), fill=soft_accent)
 
     if story_num == 1:
-        # COP31: Wireframe globe + gavel + fractured agreement sheet
+        # COP31: Wireframe globe + fractured agreement sheet
         r = int(w * 0.33)
         gy = y0 + int(h * 0.34)
         draw.ellipse((cx - r, gy - r, cx + r, gy + r), fill=WHITE, outline=ink, width=lw)
@@ -474,255 +470,226 @@ def draw_card_illustration(
         draw.line((cx - r, gy, cx + r, gy), fill=accent, width=lw_thin)
         draw.arc((cx - r, gy - r // 2, cx + r, gy + r // 2), 180, 360, fill=ink, width=lw_thin)
         # Cracked treaty page below
-        px0, py0, px1, py1 = cx - int(w * 0.30), y0 + int(h * 0.62), cx + int(w * 0.30), y1 - sx(8)
+        px0, py0, px1, py1 = cx - int(w * 0.30), y0 + int(h * 0.62), cx + int(w * 0.30), y1 - 8
         draw.rectangle((px0, py0, px1, py1), fill=WHITE, outline=ink, width=lw)
         for frac in (0.28, 0.48, 0.68):
             ly = py0 + int((py1 - py0) * frac)
-            draw.line((px0 + sx(5), ly, px1 - sx(5), ly), fill=INK_MUTED, width=lw_thin)
-        # Jagged crack / X across treaty
+            draw.line((px0 + 5, ly, px1 - 5, ly), fill=INK_MUTED, width=lw_thin)
+        # Jagged X across treaty
         draw.line(
-            [(px0 + sx(6), py0 + sx(4)), (cx, (py0 + py1) // 2), (px1 - sx(6), py1 - sx(4))],
+            [(px0 + 6, py0 + 4), (cx, (py0 + py1) // 2), (px1 - 6, py1 - 4)],
             fill=CRIMSON, width=lw,
         )
         draw.line(
-            [(px1 - sx(6), py0 + sx(4)), (cx, (py0 + py1) // 2), (px0 + sx(6), py1 - sx(4))],
+            [(px1 - 6, py0 + 4), (cx, (py0 + py1) // 2), (px0 + 6, py1 - 4)],
             fill=CRIMSON, width=lw,
         )
 
     elif story_num == 2:
         # Iran claims strikes on US bases: Radar dish + signal arcs + trajectory
-        # Trajectory arc from top-right to radar
-        draw.arc((x0 + sx(6), y0 + sx(10), x1 + sx(18), y0 + int(h * 0.65)), 180, 275, fill=CRIMSON, width=lw)
-        # Impact starburst at top-left
-        bx, by = x0 + int(w * 0.30), y0 + int(h * 0.30)
+        draw.arc((x0 + 10, y0 + 12, x1 + 14, y0 + int(h * 0.65)), 180, 268, fill=CRIMSON, width=lw)
+        # Impact starburst at top-left (cleanly inset)
+        bx, by = x0 + int(w * 0.35), y0 + int(h * 0.30)
         for ang in range(0, 360, 45):
             rad = math.radians(ang)
-            r1, r2 = sx(4), sx(11)
+            r1, r2 = 3, 9
             draw.line(
                 (bx + math.cos(rad) * r1, by + math.sin(rad) * r1,
                  bx + math.cos(rad) * r2, by + math.sin(rad) * r2),
                 fill=CRIMSON, width=lw_thin,
             )
         # Radar dish at bottom
-        rx, ry = cx + sx(4), y0 + int(h * 0.68)
-        draw.pieslice((rx - sx(20), ry - sx(20), rx + sx(20), ry + sx(20)), 145, 325, fill=WHITE, outline=ink, width=lw)
-        draw.line((rx, ry, rx - sx(10), ry - sx(14)), fill=ink, width=lw)
-        draw.ellipse((rx - sx(13), ry - sx(17), rx - sx(7), ry - sx(11)), fill=accent, outline=ink, width=lw_thin)
+        rx, ry = cx + 4, y0 + int(h * 0.68)
+        draw.pieslice((rx - 20, ry - 20, rx + 20, ry + 20), 145, 325, fill=WHITE, outline=ink, width=lw)
+        draw.line((rx, ry, rx - 10, ry - 14), fill=ink, width=lw)
+        draw.ellipse((rx - 13, ry - 17, rx - 7, ry - 11), fill=accent, outline=ink, width=lw_thin)
         # Tripod base
-        draw.line((rx, ry + sx(6), rx - sx(14), y1 - sx(8)), fill=ink, width=lw)
-        draw.line((rx, ry + sx(6), rx + sx(14), y1 - sx(8)), fill=ink, width=lw)
-        draw.line((x0 + sx(8), y1 - sx(8), x1 - sx(8), y1 - sx(8)), fill=ink, width=lw)
+        draw.line((rx, ry + 6, rx - 14, y1 - 8), fill=ink, width=lw)
+        draw.line((rx, ry + 6, rx + 14, y1 - 8), fill=ink, width=lw)
+        draw.line((x0 + 8, y1 - 8, x1 - 8, y1 - 8), fill=ink, width=lw)
 
     elif story_num == 3:
         # Frigate Merkury ablaze: Naval ship silhouette + smoke plumes + waves
         wy = y0 + int(h * 0.72)
-        # Smoke plumes rising
         for sx_off, sy_off, rad in [(-8, 0.22, 13), (4, 0.32, 15), (-4, 0.44, 11)]:
             draw.ellipse(
-                (cx + sx(sx_off) - sx(rad), y0 + int(h * sy_off) - sx(rad),
-                 cx + sx(sx_off) + sx(rad), y0 + int(h * sy_off) + sx(rad)),
+                (cx + sx_off - rad, y0 + int(h * sy_off) - rad,
+                 cx + sx_off + rad, y0 + int(h * sy_off) + rad),
                 fill=mid_accent, outline=ink, width=lw_thin,
             )
         # Flame peaks on deck
         draw.polygon(
-            [(cx - sx(10), wy - sx(12)), (cx - sx(3), wy - sx(28)), (cx + sx(2), wy - sx(16)),
-             (cx + sx(8), wy - sx(26)), (cx + sx(13), wy - sx(12))],
+            [(cx - 10, wy - 12), (cx - 3, wy - 28), (cx + 2, wy - 16),
+             (cx + 8, wy - 26), (cx + 13, wy - 12)],
             fill=CRIMSON, outline=ink, width=lw_thin,
         )
         # Naval hull + superstructure
         draw.polygon(
-            [(x0 + sx(7), wy - sx(9)), (x1 - sx(7), wy - sx(9)),
-             (x1 - sx(13), wy + sx(4)), (x0 + sx(11), wy + sx(4))],
+            [(x0 + 7, wy - 9), (x1 - 7, wy - 9),
+             (x1 - 13, wy + 4), (x0 + 11, wy + 4)],
             fill=WHITE, outline=ink, width=lw,
         )
-        draw.rectangle((cx - sx(13), wy - sx(19), cx + sx(8), wy - sx(9)), fill=WHITE, outline=ink, width=lw)
-        draw.line((cx - sx(4), wy - sx(19), cx - sx(4), wy - sx(31)), fill=ink, width=lw)
-        _draw_wave(draw, x0 + sx(6), x1 - sx(6), wy + sx(8), sx(3), 2.5, accent, lw)
-        _draw_wave(draw, x0 + sx(8), x1 - sx(8), wy + sx(16), sx(2.5), 2.0, ink, lw_thin)
+        draw.rectangle((cx - 13, wy - 19, cx + 8, wy - 9), fill=WHITE, outline=ink, width=lw)
+        draw.line((cx - 4, wy - 19, cx - 4, wy - 31), fill=ink, width=lw)
+        _draw_wave(draw, x0 + 6, x1 - 6, wy + 8, 3.0, 2.5, accent, lw)
+        _draw_wave(draw, x0 + 8, x1 - 8, wy + 16, 2.5, 2.0, ink, lw_thin)
 
     elif story_num == 4:
         # Maltese tanker hit by suicide drone boat
         ty = y0 + int(h * 0.56)
-        # Tanker hull
         draw.polygon(
-            [(x0 + sx(6), ty - sx(6)), (x1 - sx(6), ty - sx(6)),
-             (x1 - sx(10), ty + sx(7)), (x0 + sx(10), ty + sx(7))],
+            [(x0 + 8, ty - 6), (x1 - 8, ty - 6),
+             (x1 - 12, ty + 7), (x0 + 12, ty + 7)],
             fill=WHITE, outline=ink, width=lw,
         )
-        # Aft bridge & funnel
-        draw.rectangle((x1 - sx(20), ty - sx(20), x1 - sx(9), ty - sx(6)), fill=WHITE, outline=ink, width=lw)
-        draw.rectangle((x0 + sx(14), ty - sx(11), x1 - sx(24), ty - sx(6)), fill=mid_accent, outline=ink, width=lw_thin)
+        draw.rectangle((x1 - 21, ty - 20, x1 - 10, ty - 6), fill=WHITE, outline=ink, width=lw)
+        draw.rectangle((x0 + 15, ty - 11, x1 - 25, ty - 6), fill=mid_accent, outline=ink, width=lw_thin)
         # Small USV drone boat below approaching impact point
-        ux, uy = x0 + sx(20), ty + sx(22)
-        draw.polygon([(ux - sx(10), uy), (ux + sx(10), uy - sx(4)), (ux + sx(4), uy + sx(4))], fill=accent, outline=ink, width=lw)
-        # Dashed attack vector + impact flash
-        draw.line((ux + sx(8), uy - sx(5), cx - sx(2), ty + sx(6)), fill=CRIMSON, width=lw)
+        ux, uy = x0 + 20, ty + 22
+        draw.polygon([(ux - 9, uy), (ux + 9, uy - 4), (ux + 4, uy + 4)], fill=accent, outline=ink, width=lw)
+        draw.line((ux + 8, uy - 5, cx - 2, ty + 6), fill=CRIMSON, width=lw)
         for dx, dy in [(-10, -16), (0, -22), (10, -16), (-14, -6), (14, -6)]:
-            draw.line((cx - sx(2), ty - sx(6), cx - sx(2) + sx(dx), ty - sx(6) + sx(dy)), fill=CRIMSON, width=lw_thin)
-        _draw_wave(draw, x0 + sx(6), x1 - sx(6), ty + sx(12), sx(2.5), 2.5, accent, lw)
-        _draw_wave(draw, x0 + sx(6), x1 - sx(6), y1 - sx(9), sx(2.5), 2.0, ink, lw_thin)
+            draw.line((cx - 2, ty - 6, cx - 2 + dx, ty - 6 + dy), fill=CRIMSON, width=lw_thin)
+        _draw_wave(draw, x0 + 8, x1 - 8, ty + 12, 2.5, 2.5, accent, lw)
+        _draw_wave(draw, x0 + 8, x1 - 8, y1 - 9, 2.5, 2.0, ink, lw_thin)
 
     elif story_num == 5:
         # Dymer flats hit by Russian drones: apartment block + delta-wing drone
-        # Delta-wing drone top
         dy = y0 + int(h * 0.22)
         draw.polygon(
-            [(cx, dy - sx(11)), (cx + sx(18), dy + sx(6)), (cx, dy + sx(2)), (cx - sx(18), dy + sx(6))],
+            [(cx, dy - 11), (cx + 18, dy + 6), (cx, dy + 2), (cx - 18, dy + 6)],
             fill=accent, outline=ink, width=lw,
         )
-        # Apartment facade below
-        bx0, by0, bx1, by1 = x0 + sx(10), y0 + int(h * 0.40), x1 - sx(10), y1 - sx(7)
+        bx0, by0, bx1, by1 = x0 + 10, y0 + int(h * 0.40), x1 - 10, y1 - 7
         draw.rectangle((bx0, by0, bx1, by1), fill=WHITE, outline=ink, width=lw)
-        # Grid of windows
         cols, rows = 3, 4
-        ww, wh = sx(8), sx(7)
+        ww, wh = 8, 7
         for r_i in range(rows):
             for c_i in range(cols):
-                wx = bx0 + sx(5) + c_i * sx(13)
-                wy_i = by0 + sx(5) + r_i * sx(11)
+                wx = bx0 + 5 + c_i * 13
+                wy_i = by0 + 5 + r_i * 11
                 fill_w = DARK_BAR if (r_i == 0 and c_i == 1) else soft_accent
                 draw.rectangle((wx, wy_i, wx + ww, wy_i + wh), fill=fill_w, outline=ink, width=lw_thin)
-        # Impact crack lines at top-center of building
-        ix, iy = cx, by0 + sx(7)
+        ix, iy = cx, by0 + 7
         for dx, dy2 in [(-12, -8), (12, -8), (-10, 10), (11, 8)]:
-            draw.line((ix, iy, ix + sx(dx), iy + sx(dy2)), fill=CRIMSON, width=lw_thin)
+            draw.line((ix, iy, ix + dx, iy + dy2), fill=CRIMSON, width=lw_thin)
 
     elif story_num == 6:
-        # Emergency blackouts: High-voltage transmission pylon + crossed bolt
-        top_y = y0 + sx(12)
-        bot_y = y1 - sx(8)
-        # Pylon A-frame
-        draw.line((cx, top_y, cx - sx(16), bot_y), fill=ink, width=lw)
-        draw.line((cx, top_y, cx + sx(16), bot_y), fill=ink, width=lw)
-        # Cross arms
+        # Emergency blackouts: High-voltage transmission pylon + lightning bolt
+        top_y = y0 + 12
+        bot_y = y1 - 8
+        draw.line((cx, top_y, cx - 16, bot_y), fill=ink, width=lw)
+        draw.line((cx, top_y, cx + 16, bot_y), fill=ink, width=lw)
         for frac, span in [(0.25, 20), (0.48, 23)]:
             ay = top_y + int((bot_y - top_y) * frac)
-            draw.line((cx - sx(span), ay, cx + sx(span), ay), fill=ink, width=lw)
-            # Insulator drops
-            draw.line((cx - sx(span), ay, cx - sx(span), ay + sx(6)), fill=accent, width=lw_thin)
-            draw.line((cx + sx(span), ay, cx + sx(span), ay + sx(6)), fill=accent, width=lw_thin)
-        # Internal truss X
+            draw.line((cx - span, ay, cx + span, ay), fill=ink, width=lw)
+            draw.line((cx - span, ay, cx - span, ay + 6), fill=accent, width=lw_thin)
+            draw.line((cx + span, ay, cx + span, ay + 6), fill=accent, width=lw_thin)
         mid1 = top_y + int((bot_y - top_y) * 0.48)
         mid2 = top_y + int((bot_y - top_y) * 0.78)
-        draw.line((cx - sx(8), mid1, cx + sx(12), mid2), fill=ink, width=lw_thin)
-        draw.line((cx + sx(8), mid1, cx - sx(12), mid2), fill=ink, width=lw_thin)
-        # Lightning bolt badge (amber/crimson)
+        draw.line((cx - 8, mid1, cx + 12, mid2), fill=ink, width=lw_thin)
+        draw.line((cx + 8, mid1, cx - 12, mid2), fill=ink, width=lw_thin)
         bolt = [
-            (cx + sx(4), cy - sx(4)), (cx - sx(6), cy + sx(10)),
-            (cx + sx(1), cy + sx(10)), (cx - sx(4), cy + sx(24)),
-            (cx + sx(10), cy + sx(7)), (cx + sx(2), cy + sx(7)),
+            (cx + 4, cy - 4), (cx - 6, cy + 10),
+            (cx + 1, cy + 10), (cx - 4, cy + 24),
+            (cx + 10, cy + 7), (cx + 2, cy + 7),
         ]
         draw.polygon(bolt, fill=CRIMSON, outline=ink, width=lw_thin)
 
     elif story_num == 7:
         # Mines in Hormuz: Horned sea mine + two tanker outlines
-        # Distant tanker hulls at top
         for ty_f in (0.18, 0.30):
             ty = y0 + int(h * ty_f)
             draw.polygon(
-                [(x0 + sx(10), ty), (x1 - sx(10), ty), (x1 - sx(14), ty + sx(5)), (x0 + sx(14), ty + sx(5))],
+                [(x0 + 10, ty), (x1 - 10, ty), (x1 - 14, ty + 5), (x0 + 14, ty + 5)],
                 fill=WHITE, outline=ink, width=lw_thin,
             )
-        # Sea mine sphere in center-bottom
         my = y0 + int(h * 0.64)
-        mr = sx(15)
+        mr = 15
         for ang in range(0, 360, 45):
             rad = math.radians(ang)
             draw.line(
-                (cx + math.cos(rad) * (mr - sx(2)), my + math.sin(rad) * (mr - sx(2)),
-                 cx + math.cos(rad) * (mr + sx(8)), my + math.sin(rad) * (mr + sx(8))),
+                (cx + math.cos(rad) * (mr - 2), my + math.sin(rad) * (mr - 2),
+                 cx + math.cos(rad) * (mr + 8), my + math.sin(rad) * (mr + 8)),
                 fill=ink, width=lw,
             )
         draw.ellipse((cx - mr, my - mr, cx + mr, my + mr), fill=mid_accent, outline=ink, width=lw)
-        draw.ellipse((cx - sx(5), my - sx(5), cx + sx(5), my + sx(5)), fill=WHITE, outline=ink, width=lw_thin)
-        _draw_wave(draw, x0 + sx(6), x1 - sx(6), y0 + int(h * 0.42), sx(2.5), 2.5, accent, lw)
+        draw.ellipse((cx - 5, my - 5, cx + 5, my + 5), fill=WHITE, outline=ink, width=lw_thin)
+        _draw_wave(draw, x0 + 8, x1 - 8, y0 + int(h * 0.42), 2.5, 2.5, accent, lw)
 
     elif story_num == 8:
         # Gaza toll 74,742: Editorial escalating bar chart + humanitarian medical cross
-        # Medical cross in top circle
-        cr = sx(12)
+        cr = 12
         my = y0 + int(h * 0.24)
         draw.ellipse((cx - cr, my - cr, cx + cr, my + cr), fill=WHITE, outline=ink, width=lw)
-        draw.rectangle((cx - sx(3), my - sx(8), cx + sx(3), my + sx(8)), fill=CRIMSON)
-        draw.rectangle((cx - sx(8), my - sx(3), cx + sx(8), my + sx(3)), fill=CRIMSON)
-        # Rising bar chart below
-        base_y = y1 - sx(10)
-        draw.line((x0 + sx(8), base_y, x1 - sx(8), base_y), fill=ink, width=lw)
+        draw.rectangle((cx - 3, my - 8, cx + 3, my + 8), fill=CRIMSON)
+        draw.rectangle((cx - 8, my - 3, cx + 8, my + 3), fill=CRIMSON)
+        base_y = y1 - 10
+        draw.line((x0 + 8, base_y, x1 - 8, base_y), fill=ink, width=lw)
         heights = [12, 18, 25, 33, 42]
-        bw = sx(7)
-        start_x = x0 + sx(10)
+        bw = 7
+        start_x = x0 + 10
         for idx, bh in enumerate(heights):
-            bx = start_x + idx * sx(9)
+            bx = start_x + idx * 9
             fill_b = CRIMSON if idx == len(heights) - 1 else mid_accent
-            draw.rectangle((bx, base_y - sx(bh), bx + bw, base_y), fill=fill_b, outline=ink, width=lw_thin)
+            draw.rectangle((bx, base_y - bh, bx + bw, base_y), fill=fill_b, outline=ink, width=lw_thin)
 
     elif story_num == 9:
         # Khartoum homes + UN site + drone
-        # Quad drone hovering top
         dy = y0 + int(h * 0.20)
-        draw.line((cx - sx(16), dy, cx + sx(16), dy), fill=ink, width=lw)
-        draw.ellipse((cx - sx(6), dy - sx(4), cx + sx(6), dy + sx(4)), fill=accent, outline=ink, width=lw_thin)
-        for rx in (cx - sx(16), cx + sx(16)):
-            draw.line((rx - sx(5), dy - sx(4), rx + sx(5), dy - sx(4)), fill=ink, width=lw_thin)
-        # Arched Khartoum structures + UN flag compound
-        base_y = y1 - sx(9)
-        draw.rectangle((x0 + sx(8), base_y - sx(26), cx + sx(2), base_y), fill=WHITE, outline=ink, width=lw)
-        draw.chord((x0 + sx(13), base_y - sx(16), x0 + sx(25), base_y + sx(8)), 180, 360, fill=soft_accent, outline=ink, width=lw_thin)
-        draw.rectangle((cx + sx(2), base_y - sx(36), x1 - sx(8), base_y), fill=WHITE, outline=ink, width=lw)
-        # UN flag pole & globe banner
-        fx, fy = cx + sx(13), base_y - sx(36)
-        draw.line((fx, fy, fx, fy - sx(16)), fill=ink, width=lw_thin)
-        draw.rectangle((fx, fy - sx(16), fx + sx(12), fy - sx(8)), fill=(29, 98, 168), outline=ink, width=lw_thin)
+        draw.line((cx - 16, dy, cx + 16, dy), fill=ink, width=lw)
+        draw.ellipse((cx - 6, dy - 4, cx + 6, dy + 4), fill=accent, outline=ink, width=lw_thin)
+        for rx in (cx - 16, cx + 16):
+            draw.line((rx - 5, dy - 4, rx + 5, dy - 4), fill=ink, width=lw_thin)
+        base_y = y1 - 9
+        draw.rectangle((x0 + 8, base_y - 26, cx + 2, base_y), fill=WHITE, outline=ink, width=lw)
+        draw.chord((x0 + 13, base_y - 16, x0 + 25, base_y + 8), 180, 360, fill=soft_accent, outline=ink, width=lw_thin)
+        draw.rectangle((cx + 2, base_y - 36, x1 - 8, base_y), fill=WHITE, outline=ink, width=lw)
+        fx, fy = cx + 13, base_y - 36
+        draw.line((fx, fy, fx, fy - 16), fill=ink, width=lw_thin)
+        draw.rectangle((fx, fy - 16, fx + 12, fy - 8), fill=(29, 98, 168), outline=ink, width=lw_thin)
 
     elif story_num == 10:
         # UN: drones cause nearly 3/4 of Sudan war deaths -> 270 deg donut chart + drone
-        r = sx(20)
+        r = 20
         py = y0 + int(h * 0.42)
-        # Full circle base (1/4 remaining)
         draw.ellipse((cx - r, py - r, cx + r, py + r), fill=WHITE, outline=ink, width=lw)
-        # 3/4 filled wedge (270 degrees)
         draw.pieslice((cx - r, py - r, cx + r, py + r), 270, 180, fill=accent, outline=ink, width=lw)
-        # Inner cutout for donut clarity
-        ir = sx(9)
+        ir = 9
         draw.ellipse((cx - ir, py - ir, cx + ir, py + ir), fill=ILLUS_BG, outline=ink, width=lw_thin)
-        # Small drone silhouette below
-        dy = y1 - sx(16)
+        dy = y1 - 16
         draw.polygon(
-            [(cx, dy - sx(7)), (cx + sx(15), dy + sx(5)), (cx, dy + sx(1)), (cx - sx(15), dy + sx(5))],
+            [(cx, dy - 7), (cx + 15, dy + 5), (cx, dy + 1), (cx - 15, dy + 5)],
             fill=ink, outline=ink, width=lw_thin,
         )
 
     elif story_num == 11:
         # Vietnam floods: diagonal rain + submerged roof peak + waves
-        # Diagonal rain streaks at top
         for rx_off in range(-18, 22, 9):
             draw.line(
-                (cx + sx(rx_off) + sx(4), y0 + sx(10), cx + sx(rx_off) - sx(3), y0 + sx(26)),
+                (cx + rx_off + 4, y0 + 10, cx + rx_off - 3, y0 + 26),
                 fill=accent, width=lw_thin,
             )
-        # Pitched roof emerging from floodwater
         ry = y0 + int(h * 0.56)
-        draw.polygon([(cx - sx(20), ry), (cx, ry - sx(17)), (cx + sx(20), ry)], fill=WHITE, outline=ink, width=lw)
-        draw.rectangle((cx - sx(13), ry, cx + sx(13), ry + sx(12)), fill=soft_accent, outline=ink, width=lw)
-        # Floodwater wave bands below
+        draw.polygon([(cx - 20, ry), (cx, ry - 17), (cx + 20, ry)], fill=WHITE, outline=ink, width=lw)
+        draw.rectangle((cx - 13, ry, cx + 13, ry + 12), fill=soft_accent, outline=ink, width=lw)
         for wy_off, col in [(6, accent), (15, ink), (24, accent)]:
-            _draw_wave(draw, x0 + sx(6), x1 - sx(6), ry + sx(wy_off), sx(3), 2.5, col, lw)
+            _draw_wave(draw, x0 + 8, x1 - 8, ry + wy_off, 3.0, 2.5, col, lw)
 
     elif story_num == 12:
         # Bangladesh quake: concentric epicenter rings + jagged seismograph waveform
         ey = y0 + int(h * 0.34)
-        for rr in (sx(20), sx(13), sx(6)):
-            draw.ellipse((cx - rr, ey - rr, cx + rr, ey + rr), outline=accent if rr != sx(6) else CRIMSON, width=lw_thin)
-        draw.ellipse((cx - sx(3), ey - sx(3), cx + sx(3), ey + sx(3)), fill=CRIMSON)
-        # Seismograph waveform across bottom half
+        for rr in (20, 13, 6):
+            draw.ellipse((cx - rr, ey - rr, cx + rr, ey + rr), outline=accent if rr != 6 else CRIMSON, width=lw_thin)
+        draw.ellipse((cx - 3, ey - 3, cx + 3, ey + 3), fill=CRIMSON)
         sy = y0 + int(h * 0.74)
-        draw.line((x0 + sx(6), sy, x1 - sx(6), sy), fill=CARD_BORDER, width=lw_thin)
+        draw.line((x0 + 8, sy, x1 - 8, sy), fill=CARD_BORDER, width=lw_thin)
         wave_pts = [
-            (x0 + sx(6), sy), (x0 + sx(14), sy), (x0 + sx(18), sy - sx(6)),
-            (x0 + sx(22), sy + sx(9)), (x0 + sx(27), sy - sx(18)),
-            (x0 + sx(32), sy + sx(20)), (x0 + sx(37), sy - sx(14)),
-            (x0 + sx(42), sy + sx(8)), (x0 + sx(47), sy - sx(4)),
-            (x0 + sx(52), sy), (x1 - sx(6), sy),
+            (x0 + 8, sy), (x0 + 14, sy), (x0 + 18, sy - 6),
+            (x0 + 22, sy + 9), (x0 + 27, sy - 18),
+            (x0 + 32, sy + 20), (x0 + 37, sy - 14),
+            (x0 + 42, sy + 8), (x0 + 47, sy - 4),
+            (x0 + 51, sy), (x1 - 8, sy),
         ]
         draw.line(wave_pts, fill=ink, width=lw, joint="curve")
 
@@ -730,7 +697,6 @@ def draw_card_illustration(
 # ---------------------------------------------------------------------------
 # Vector World Map (7-Region Colored + Pins 13–20, Pure Pillow Polygons)
 # ---------------------------------------------------------------------------
-# Stylized clean equirectangular lon/lat polygons for all 7 regions
 MAP_POLYGONS: List[Tuple[str, List[Tuple[float, float]]]] = [
     # AMERICAS (Purple tint)
     ("AMERICAS", [
@@ -784,21 +750,21 @@ MAP_POLYGONS: List[Tuple[str, List[Tuple[float, float]]]] = [
 
 # Maritime corridors for AT SEA region (Med, Red Sea, Hormuz, Black Sea)
 AT_SEA_LANES: List[List[Tuple[float, float]]] = [
-    [(-5, 36), (6, 38), (16, 35), (26, 34), (32, 31)],          # Mediterranean (Benghazi)
+    [(-5, 36), (6, 38), (16, 35), (26, 34), (32, 31)],             # Mediterranean (Benghazi)
     [(33, 29), (38, 21), (43, 13), (52, 13), (58, 22), (56, 26)],  # Red Sea -> Hormuz
-    [(29, 42), (35, 43), (40, 44)],                              # Black Sea
+    [(29, 42), (35, 43), (40, 44)],                                 # Black Sea
 ]
 
-# Custom label offsets (dx_logical, dy_logical) for pins 13–20 so zero pins collide
+# Custom label offsets (dx, dy in px) for pins 13–20 so zero pins collide
 PIN_OFFSETS: Dict[int, Tuple[int, int]] = {
-    13: (20, -14),   # Bratislava -> NE into Eastern Europe (clear of Mid East)
-    14: (4, -24),    # Brussels -> N
+    13: (20, -14),   # Bratislava -> NE
+    14: (4, -25),    # Brussels -> N
     15: (10, -16),   # Washington -> NE
     16: (-28, -2),   # Paris -> W
     17: (-24, 16),   # Mexico City -> SW
     18: (18, 16),    # Hong Kong -> SE
     19: (-8, -22),   # Islamabad -> N
-    20: (-10, 22),   # Lahj -> S
+    20: (16, 18),    # Lahj -> SE into Arabian Sea (clear of Africa)
 }
 
 
@@ -807,30 +773,32 @@ def draw_world_map(
     boxes: List[BoxRecord],
     map_rect: Tuple[int, int, int, int],
     list_stories: Sequence[Story],
+    font_log: List[Tuple[str, int, int, int]],
 ) -> None:
     x0, y0, x1, y1 = map_rect
     # Outer map card
-    draw.rectangle(map_rect, fill=CARD_BG, outline=CARD_BORDER, width=sx(1))
+    draw.rectangle(map_rect, fill=CARD_BG, outline=CARD_BORDER, width=1)
 
-    # Map header bar (18px logical = 72px)
-    hdr_h = sx(18)
+    # Map header bar (18px)
+    hdr_h = 18
     draw.rectangle((x0, y0, x1, y0 + hdr_h), fill=DARK_BAR)
     draw_fitted_text(
         draw, boxes, "map_header",
         "WORLD DISPATCH MAP · 7 REGIONS · PINS 13–20",
-        load_font(FONT_SANS_BOLD, sx(9)),
-        x0 + sx(8), y0, (x1 - x0) - sx(16), 1, WHITE,
+        load_font(FONT_SANS_BOLD, 9),
+        x0 + 8, y0, (x1 - x0) - 16, 1, WHITE,
         align="left", valign="middle", box_h=hdr_h,
+        font_log=font_log,
     )
 
     # Inner map projection rectangle
-    pad = sx(4)
+    pad = 4
     mx0, my0 = x0 + pad, y0 + hdr_h + pad
-    mx1, my1 = x1 - pad, y1 - sx(20)  # leave bottom strip for 7-region map key
+    mx1, my1 = x1 - pad, y1 - 21  # bottom strip for 7-region map key
     mw = mx1 - mx0
     mh = my1 - my0
 
-    draw.rectangle((mx0, my0, mx1, my1), fill=OCEAN_BG, outline=CARD_BORDER, width=sx(1))
+    draw.rectangle((mx0, my0, mx1, my1), fill=OCEAN_BG, outline=CARD_BORDER, width=1)
 
     def proj(lon: float, lat: float) -> Tuple[int, int]:
         # Lon -180..180, Lat -78..82
@@ -838,82 +806,86 @@ def draw_world_map(
         py = my0 + int(round((82.0 - lat) / 160.0 * mh))
         return (px, py)
 
-    # Graticule lines every 30 deg
+    # Graticule lines every 30 deg (1px crisp hairlines)
     for lon in range(-150, 180, 30):
         p1, p2 = proj(lon, 82), proj(lon, -78)
-        draw.line((p1, p2), fill=OCEAN_GRID, width=sx(0.5))
+        draw.line((p1, p2), fill=OCEAN_GRID, width=1)
     for lat in range(-60, 90, 30):
         p1, p2 = proj(-180, lat), proj(180, lat)
-        w_line = sx(0.75) if lat == 0 else sx(0.5)
-        draw.line((p1, p2), fill=OCEAN_GRID, width=w_line)
+        draw.line((p1, p2), fill=OCEAN_GRID, width=1)
 
     # Draw AT SEA maritime lanes first
     sea_col = REGION_COLORS["AT SEA"]
     for lane in AT_SEA_LANES:
         pts = [proj(lo, la) for lo, la in lane]
-        draw.line(pts, fill=tint(sea_col, 0.35), width=sx(3), joint="curve")
-        draw.line(pts, fill=sea_col, width=sx(1), joint="curve")
+        draw.line(pts, fill=tint(sea_col, 0.35), width=3, joint="curve")
+        draw.line(pts, fill=sea_col, width=1, joint="curve")
 
     # Draw 7-region colored continents
     for region, poly in MAP_POLYGONS:
         pts = [proj(lo, la) for lo, la in poly]
         base = REGION_COLORS[region]
-        draw.polygon(pts, fill=tint(base, 0.45), outline=tint(base, 0.08))
-        # Crisp coastline stroke
-        draw.line(pts + [pts[0]], fill=tint(base, 0.12), width=sx(0.75))
+        draw.polygon(pts, fill=tint(base, 0.45), outline=tint(base, 0.12))
 
     # Draw numbered event pins 13–20 with crisp leader lines
-    pin_sz = sx(17)  # 17x17 logical = 68x68 physical
-    pin_font = load_font(FONT_SANS_BOLD, sx(10))
+    pin_sz = 17
+    pin_font = load_font(FONT_SANS_BOLD, 10)
     for st in list_stories:
         gx, gy = proj(st.lon, st.lat)
-        ox_l, oy_l = PIN_OFFSETS[st.num]
-        px = max(mx0 + sx(2), min(mx1 - pin_sz - sx(2), gx + sx(ox_l) - pin_sz // 2))
-        py = max(my0 + sx(2), min(my1 - pin_sz - sx(2), gy + sx(oy_l) - pin_sz // 2))
+        ox, oy = PIN_OFFSETS[st.num]
+        px = max(mx0 + 2, min(mx1 - pin_sz - 2, gx + ox - pin_sz // 2))
+        py = max(my0 + 2, min(my1 - pin_sz - 2, gy + oy - pin_sz // 2))
         pcx, pcy = px + pin_sz // 2, py + pin_sz // 2
         col = REGION_COLORS[st.region]
 
         # Leader line + anchor dot at true coordinates
-        draw.line((gx, gy, pcx, pcy), fill=INK_BLACK, width=sx(1))
-        r_dot = sx(2.0)
-        draw.ellipse((gx - r_dot, gy - r_dot, gx + r_dot, gy + r_dot), fill=col, outline=WHITE, width=sx(0.75))
+        draw.line((gx, gy, pcx, pcy), fill=INK_BLACK, width=1)
+        r_dot = 2
+        draw.ellipse((gx - r_dot, gy - r_dot, gx + r_dot, gy + r_dot), fill=col, outline=WHITE, width=1)
 
         # Solid numbered badge pin
         pin_box = (px, py, px + pin_sz, py + pin_sz)
-        draw.rectangle(pin_box, fill=col, outline=WHITE, width=sx(1))
+        draw.rectangle(pin_box, fill=col, outline=WHITE, width=1)
         draw_fitted_text(
             draw, boxes, f"map_pin_txt_{st.num}",
             str(st.num), pin_font,
             px, py, pin_sz, 1, WHITE,
             align="center", valign="middle", box_h=pin_sz,
-            register=False,
+            register=False, font_log=font_log,
         )
-        # Register outer pin badge in global collision list
         boxes.append((f"map_pin_{st.num}", pin_box))
 
-    # Bottom 7-region compact key strip inside map frame
-    key_y0 = my1 + sx(3)
-    key_h = (y1 - sx(3)) - key_y0
-    key_w = (x1 - x0) - sx(8)
-    slot_w = key_w // len(REGION_ORDER)
-    key_font = load_font(FONT_SANS_CN_BOLD, sx(8))
+    # Bottom 7-region compact key strip inside map frame (evenly centered with clean side padding)
+    key_y0 = my1 + 3
+    key_h = (y1 - 3) - key_y0
+    key_font = load_font(FONT_SANS_CN_BOLD, 8)
+    sw_sz = 7
+    sw_gap = 3
+    item_widths = [sw_sz + sw_gap + _text_width(reg, key_font) + 2 for reg in REGION_ORDER]
+    pad_x = 10
+    avail_w = (x1 - x0) - 2 * pad_x
+    total_items_w = sum(item_widths)
+    gap_between = (avail_w - total_items_w) / max(1, len(REGION_ORDER) - 1)
+    cur_kx = float(x0 + pad_x)
     for idx, reg in enumerate(REGION_ORDER):
-        kx = x0 + sx(4) + idx * slot_w
-        sw_sz = sx(7)
+        kx = int(round(cur_kx))
         sy = key_y0 + (key_h - sw_sz) // 2
-        draw.rectangle((kx, sy, kx + sw_sz, sy + sw_sz), fill=REGION_COLORS[reg], outline=INK_DARK, width=sx(0.5))
+        draw.rectangle((kx, sy, kx + sw_sz, sy + sw_sz), fill=REGION_COLORS[reg], outline=INK_DARK, width=1)
+        lbl_w = _text_width(reg, key_font) + 2
         draw_fitted_text(
             draw, boxes, f"map_key_{reg}",
             reg, key_font,
-            kx + sw_sz + sx(2.5), key_y0, slot_w - sw_sz - sx(4), 1, INK_DARK,
+            kx + sw_sz + sw_gap, key_y0, lbl_w, 1, INK_DARK,
             align="left", valign="middle", box_h=key_h,
+            font_log=font_log,
         )
+        cur_kx += item_widths[idx] + gap_between
 
 
 # ---------------------------------------------------------------------------
-# Main Render Pipeline
+# Main Render Pipeline (Native 1024x1024 px)
 # ---------------------------------------------------------------------------
-def build_poster() -> Tuple[Image.Image, Dict[str, int], int]:
+def build_poster() -> Tuple[Image.Image, Dict[str, int], int, List[Tuple[str, int, int, int]]]:
     # Strict verification of data integrity
     if len(STORIES) != 20:
         raise RuntimeError(f"Expected 20 stories, got {len(STORIES)}")
@@ -932,24 +904,27 @@ def build_poster() -> Tuple[Image.Image, Dict[str, int], int]:
     img = Image.new("RGB", (CANVAS_W, CANVAS_H), BG_PAPER)
     draw = ImageDraw.Draw(img)
     boxes: List[BoxRecord] = []
+    font_log: List[Tuple[str, int, int, int]] = []
 
-    # Content horizontal bounds (aligns 3x316 + 2x8 = 964 logical px -> 18..982)
-    MX = 18
-    X0 = sx(MX)
-    X1 = sx(LOGICAL_W - MX)
-    CW = X1 - X0  # 3856 px
+    # Horizontal margins: 12px each side -> CW = 1000px
+    # Aligns bottom half exact SPEC widths (470 map + 10 gap + 520 list = 1000)
+    MX = 12
+    X0 = MX
+    X1 = CANVAS_W - MX
+    CW = X1 - X0  # 1000 px
 
     # =========================================================================
     # 1. TOP BAR (y = 0..26, height 26px, 11px uppercase)
     # =========================================================================
-    top_h = sx(26)
+    top_h = 26
     draw.rectangle((0, 0, CANVAS_W, top_h), fill=DARK_BAR)
-    top_font = load_font(FONT_SANS_BOLD, sx(11))
+    top_font = load_font(FONT_SANS_BOLD, 11)
     draw_fitted_text(
         draw, boxes, "top_left",
         "THE WORLD IN ONE DAY",
-        top_font, X0, 0, sx(280), 1, WHITE,
+        top_font, X0, 0, 280, 1, WHITE,
         align="left", valign="middle", box_h=top_h,
+        font_log=font_log,
     )
     right_banner = (
         f"{len(STORIES)} STORIES · {len(REGION_ORDER)} REGIONS · "
@@ -958,31 +933,32 @@ def build_poster() -> Tuple[Image.Image, Dict[str, int], int]:
     draw_fitted_text(
         draw, boxes, "top_right",
         right_banner,
-        top_font, X0 + sx(290), 0, CW - sx(290), 1, (232, 227, 216),
+        top_font, X0 + 290, 0, CW - 290, 1, (232, 227, 216),
         align="right", valign="middle", box_h=top_h,
+        font_log=font_log,
     )
 
     # =========================================================================
-    # 2. GIANT DATE BANNER (86px bold serif, centered, y = 30..136)
+    # 2. GIANT DATE BANNER (86px bold serif, centered, y = 30..146)
     #    + Double-color decorative rule (3px black + 1px red)
     # =========================================================================
-    date_y0 = sx(32)
-    date_h = sx(102)
-    # Allow wide span (984 logical px) so 86px bold serif stays unshrunk at 344px
+    date_y0 = 30
+    date_h = 114
     draw_fitted_text(
         draw, boxes, "giant_date",
         "Sunday 22 November 2026",
-        load_font(FONT_SERIF_BOLD, sx(86)),
-        sx(8), date_y0, sx(984), 1, INK_BLACK,
+        load_font(FONT_SERIF_BOLD, 86),
+        8, date_y0, CANVAS_W - 16, 1, INK_BLACK,
         align="center", valign="middle", box_h=date_h,
+        font_log=font_log,
     )
     # Double-color decorative rule: 3px black + 2px gap + 1px red
-    rule_y = sx(139)
-    draw.rectangle((X0, rule_y, X1, rule_y + sx(3)), fill=RULE_DARK)
-    draw.rectangle((X0, rule_y + sx(5), X1, rule_y + sx(6)), fill=CRIMSON)
+    rule_y = 148
+    draw.rectangle((X0, rule_y, X1, rule_y + 2), fill=RULE_DARK)      # 3px tall (inclusive)
+    draw.rectangle((X0, rule_y + 5, X1, rule_y + 5), fill=CRIMSON)    # 1px tall (inclusive)
 
     # =========================================================================
-    # 3. SINGLE-LINE SUMMARY (Red italic 15px, y = 148..176)
+    # 3. SINGLE-LINE SUMMARY (Red italic 15px, y = 160..188)
     # =========================================================================
     sum_text = (
         "COP31 puts its final deal to the vote · "
@@ -992,86 +968,90 @@ def build_poster() -> Tuple[Image.Image, Dict[str, int], int]:
     draw_fitted_text(
         draw, boxes, "summary_line",
         sum_text,
-        load_font(FONT_SERIF_ITAL, sx(15)),
-        X0, sx(149), CW, 1, CRIMSON,
-        align="center", valign="middle", box_h=sx(26),
+        load_font(FONT_SERIF_ITAL, 15),
+        X0, 160, CW, 1, CRIMSON,
+        align="center", valign="middle", box_h=28,
+        font_log=font_log,
     )
 
     # =========================================================================
-    # 4. SCOREBOARD STRIP (6 cells, y = 180..242: 30px bold + 9px uppercase)
+    # 4. SCOREBOARD STRIP (6 cells, y = 194..250: 30px bold + 9px uppercase)
     # =========================================================================
-    sc_y0, sc_y1 = sx(180), sx(242)
-    draw.rectangle((X0, sc_y0, X1, sc_y1), fill=SCORE_BG, outline=CARD_BORDER, width=sx(1))
-    draw.rectangle((X0, sc_y0, X1, sc_y0 + sx(1.5)), fill=RULE_DARK)
+    sc_y0, sc_y1 = 194, 250
+    draw.rectangle((X0, sc_y0, X1, sc_y1), fill=SCORE_BG, outline=CARD_BORDER, width=1)
+    draw.rectangle((X0, sc_y0, X1, sc_y0 + 1), fill=RULE_DARK)
     n_sc = len(SCOREBOARD_ITEMS)
     cell_w = CW / n_sc
-    num_font = load_font(FONT_SERIF_BOLD, sx(30))
-    lbl_font = load_font(FONT_SANS_CN_BOLD, sx(9))
+    num_font = load_font(FONT_SERIF_BOLD, 30)
+    lbl_font = load_font(FONT_SANS_CN_BOLD, 9)
     for i, (val, lbl) in enumerate(SCOREBOARD_ITEMS):
         cx0 = X0 + int(round(i * cell_w))
         cx1 = X0 + int(round((i + 1) * cell_w))
         cw_i = cx1 - cx0
         if i > 0:
-            draw.line((cx0, sc_y0 + sx(6), cx0, sc_y1 - sx(6)), fill=CARD_BORDER, width=sx(1))
+            draw.line((cx0, sc_y0 + 6, cx0, sc_y1 - 6), fill=CARD_BORDER, width=1)
         val_color = CRIMSON if i in (0, 2) else INK_BLACK
         draw_fitted_text(
             draw, boxes, f"score_num_{i}",
             val, num_font,
-            cx0 + sx(4), sc_y0 + sx(6), cw_i - sx(8), 1, val_color,
-            align="center", valign="middle", box_h=sx(36),
+            cx0 + 4, sc_y0 + 5, cw_i - 8, 1, val_color,
+            align="center", valign="middle", box_h=34,
+            font_log=font_log,
         )
         draw_fitted_text(
             draw, boxes, f"score_lbl_{i}",
             lbl, lbl_font,
-            cx0 + sx(4), sc_y0 + sx(44), cw_i - sx(8), 1, INK_DARK,
-            align="center", valign="middle", box_h=sx(14),
+            cx0 + 4, sc_y0 + 40, cw_i - 8, 1, INK_DARK,
+            align="center", valign="middle", box_h=13,
+            font_log=font_log,
         )
 
     # =========================================================================
-    # 5. 7-COLOR REGION BAR (y = 248..272, height 22px, dynamic counts, 10px bold)
+    # 5. 7-COLOR REGION BAR (y = 256..276, height 20px, dynamic counts, 10px bold)
     # =========================================================================
-    rb_y0 = sx(249)
-    rb_h = sx(22)
+    rb_y0 = 256
+    rb_h = 20
     rb_y1 = rb_y0 + rb_h
     total_stories = sum(region_counts[r] for r in REGION_ORDER)
     # Minimum base width + proportional count share (100% driven by counted stories)
-    min_seg_l = 96.0
-    extra_pool_l = (LOGICAL_W - 2 * MX) - min_seg_l * len(REGION_ORDER)
-    seg_widths_l = [
-        min_seg_l + extra_pool_l * (region_counts[r] / total_stories) for r in REGION_ORDER
+    min_seg = 98.0
+    extra_pool = CW - min_seg * len(REGION_ORDER)
+    seg_widths = [
+        min_seg + extra_pool * (region_counts[r] / total_stories) for r in REGION_ORDER
     ]
     cur_x = X0
-    rb_font = load_font(FONT_SANS_BOLD, sx(10))
+    rb_font = load_font(FONT_SANS_BOLD, 10)
     for idx, reg in enumerate(REGION_ORDER):
-        seg_w = int(round(seg_widths_l[idx] * SCALE)) if idx < len(REGION_ORDER) - 1 else (X1 - cur_x)
+        seg_w = int(round(seg_widths[idx])) if idx < len(REGION_ORDER) - 1 else (X1 - cur_x)
         seg_box = (cur_x, rb_y0, cur_x + seg_w, rb_y1)
         draw.rectangle(seg_box, fill=REGION_COLORS[reg])
         if idx > 0:
-            draw.line((cur_x, rb_y0, cur_x, rb_y1), fill=BG_PAPER, width=sx(1.5))
+            draw.line((cur_x, rb_y0, cur_x, rb_y1), fill=BG_PAPER, width=2)
         draw_fitted_text(
             draw, boxes, f"region_bar_{reg}",
             f"{reg} {region_counts[reg]}",
             rb_font,
-            cur_x + sx(3), rb_y0, seg_w - sx(6), 1, WHITE,
+            cur_x + 3, rb_y0, seg_w - 6, 1, WHITE,
             align="center", valign="middle", box_h=rb_h,
+            font_log=font_log,
         )
         cur_x += seg_w
 
     # =========================================================================
-    # 6. NUMBERED CARD GRID (12 cards: 3 cols x 4 rows, 316x100, gap 8px)
-    #    y = 279..703 (4*100 + 3*8 = 424 logical px)
+    # 6. NUMBERED CARD GRID (12 cards: 3 cols x 4 rows, height 100px, gap 8px)
+    #    y = 284..708 (4*100 + 3*8 = 424px); 3*328 + 2*8 = 1000px flush width
     # =========================================================================
-    grid_y0 = sx(279)
-    card_w = sx(316)
-    card_h = sx(100)
-    card_gap = sx(8)
+    grid_y0 = 284
+    card_gap = 8
+    card_w = (CW - 2 * card_gap) // 3  # 328px (exact 1000px flush with top/bottom)
+    card_h = 100
 
-    badge_font = load_font(FONT_SANS_BOLD, sx(17))
-    meta_font = load_font(FONT_SANS_CN_BOLD, sx(8))
-    status_font = load_font(FONT_SANS_BOLD, sx(8))
-    title_font = load_font(FONT_SERIF_BOLD, sx(17))
-    lede_font = load_font(FONT_SANS_REG, sx(11))
-    src_font = load_font(FONT_SERIF_ITAL, sx(9))
+    badge_font = load_font(FONT_SANS_BOLD, 17)
+    meta_font = load_font(FONT_SANS_CN_BOLD, 8)
+    status_font = load_font(FONT_SANS_BOLD, 8)
+    title_font = load_font(FONT_SERIF_BOLD, 17)
+    lede_font = load_font(FONT_SANS_REG, 11)
+    src_font = load_font(FONT_SERIF_ITAL, 9)
 
     for idx, st in enumerate(cards):
         col = idx % 3
@@ -1083,13 +1063,13 @@ def build_poster() -> Tuple[Image.Image, Dict[str, int], int]:
         reg_col = REGION_COLORS[st.region]
 
         # Subtle bottom shadow + crisp card body + top region stripe
-        draw.rectangle((cx0 + sx(1), cy0 + sx(2), cx1 + sx(1), cy1 + sx(2)), fill=CARD_SHADOW)
-        draw.rectangle((cx0, cy0, cx1, cy1), fill=CARD_BG, outline=CARD_BORDER, width=sx(1))
-        draw.rectangle((cx0, cy0, cx1, cy0 + sx(2.5)), fill=reg_col)
+        draw.rectangle((cx0 + 1, cy0 + 2, cx1 + 1, cy1 + 2), fill=CARD_SHADOW)
+        draw.rectangle((cx0, cy0, cx1, cy1), fill=CARD_BG, outline=CARD_BORDER, width=1)
+        draw.rectangle((cx0, cy0, cx1, cy0 + 2), fill=reg_col)
 
-        # Left Number Badge: 32x32 logical (128x128 px), solid region color, white 17px bold
-        b_sz = sx(32)
-        bx0, by0 = cx0 + sx(5), cy0 + sx(5)
+        # Left Number Badge: 32x32, solid region color, white 17px bold
+        b_sz = 32
+        bx0, by0 = cx0 + 5, cy0 + 5
         badge_rect = (bx0, by0, bx0 + b_sz, by0 + b_sz)
         draw.rectangle(badge_rect, fill=reg_col)
         draw_fitted_text(
@@ -1097,29 +1077,29 @@ def build_poster() -> Tuple[Image.Image, Dict[str, int], int]:
             str(st.num), badge_font,
             bx0, by0, b_sz, 1, WHITE,
             align="center", valign="middle", box_h=b_sz,
-            register=False,
+            register=False, font_log=font_log,
         )
         boxes.append((f"card_{st.num}_badge", badge_rect))
 
-        # Right Illustration Strip: 64x93 logical (256x372 px), 2px line art, NO faces
-        il_w = sx(64)
-        il_x0 = cx1 - sx(3) - il_w
-        il_rect = (il_x0, cy0 + sx(4), cx1 - sx(3), cy1 - sx(3))
+        # Right Illustration Strip: 64x93, 2px line art, NO faces
+        il_w = 64
+        il_x0 = cx1 - 3 - il_w
+        il_rect = (il_x0, cy0 + 4, cx1 - 3, cy1 - 3)
         draw_card_illustration(draw, st.num, il_rect, reg_col)
         boxes.append((f"card_{st.num}_illus", il_rect))
 
         # Text column right of badge & left of illustration
-        tx0 = bx0 + b_sz + sx(5)
-        tx1 = il_x0 - sx(4)
-        tw = tx1 - tx0  # ~203 logical px (812 px)
+        tx0 = bx0 + b_sz + 5
+        tx1 = il_x0 - 4
+        tw = tx1 - tx0  # 215px
 
-        # Meta Row (y+4.5..y+15): Region + Topic small tag (8px) on left + Status Pill (8px) on right
+        # Meta Row (y+4..y+15): Region + Topic small tag (8px) on left + Status Pill (8px) on right
         st_col = STATUS_COLORS[st.status]
         st_tw = _text_width(st.status, status_font)
-        pill_w = st_tw + sx(8)
-        pill_h = sx(10.5)
+        pill_w = st_tw + 8
+        pill_h = 11
         pill_x0 = tx1 - pill_w
-        pill_y0 = cy0 + sx(4.5)
+        pill_y0 = cy0 + 4
         pill_rect = (pill_x0, pill_y0, tx1, pill_y0 + pill_h)
         draw.rectangle(pill_rect, fill=st_col)
         draw_fitted_text(
@@ -1127,85 +1107,90 @@ def build_poster() -> Tuple[Image.Image, Dict[str, int], int]:
             st.status, status_font,
             pill_x0, pill_y0, pill_w, 1, WHITE,
             align="center", valign="middle", box_h=pill_h,
-            register=False,
+            register=False, font_log=font_log,
         )
         boxes.append((f"card_{st.num}_status", pill_rect))
 
-        meta_w = (pill_x0 - sx(4)) - tx0
+        meta_w = (pill_x0 - 4) - tx0
         draw_fitted_text(
             draw, boxes, f"card_{st.num}_meta",
             f"{st.region} · {st.topic_or_city}",
             meta_font,
             tx0, pill_y0, meta_w, 1, INK_MUTED,
             align="left", valign="middle", box_h=pill_h,
+            font_log=font_log,
         )
 
         # Bold Serif Headline (17px, max 2 lines) beside badge
-        hl_y0 = cy0 + sx(18)
-        hl_h = sx(39)
+        hl_y0 = cy0 + 18
+        hl_h = 40
         draw_fitted_text(
             draw, boxes, f"card_{st.num}_title",
             st.title, title_font,
             tx0, hl_y0, tw, 2, INK_BLACK,
             align="left", valign="top", box_h=hl_h, line_spacing=1.06,
+            font_log=font_log,
         )
 
         # Lede (11px, max 2 lines) spanning full left-to-illus width below badge+headline
-        lede_x0 = cx0 + sx(5)
-        lede_w = tx1 - lede_x0  # ~240 logical px (960 px)
-        lede_y0 = cy0 + sx(59.5)
-        lede_h = sx(26)
+        lede_x0 = cx0 + 5
+        lede_w = tx1 - lede_x0  # 252px
+        lede_y0 = cy0 + 59
+        lede_h = 26
         draw_fitted_text(
             draw, boxes, f"card_{st.num}_lede",
             st.lede, lede_font,
             lede_x0, lede_y0, lede_w, 2, INK_DARK,
             align="left", valign="top", box_h=lede_h, line_spacing=1.08,
+            font_log=font_log,
         )
 
         # Source (9px italic, 1 line) at card foot
-        src_y0 = cy0 + sx(87)
-        src_h = sx(10)
+        src_y0 = cy0 + 87
+        src_h = 10
         draw_fitted_text(
             draw, boxes, f"card_{st.num}_source",
             f"Source: {st.source}", src_font,
             lede_x0, src_y0, lede_w, 1, INK_MUTED,
             align="left", valign="middle", box_h=src_h,
+            font_log=font_log,
         )
 
     # =========================================================================
-    # 7. BOTTOM HALF (y = 711..967, height 256px): Left Map + Right List 13–20
+    # 7. BOTTOM HALF (y = 716..990, height 274px): Left Map 470px + Right List 520px
     # =========================================================================
-    bot_y0 = sx(711)
-    bot_y1 = sx(967)
-    map_w = sx(458)
-    mid_gap = sx(10)
+    bot_y0 = 716
+    bot_y1 = 990
+    map_w = 470
+    mid_gap = 10
     map_rect = (X0, bot_y0, X0 + map_w, bot_y1)
     list_x0 = X0 + map_w + mid_gap
-    list_rect = (list_x0, bot_y0, X1, bot_y1)
+    list_rect = (list_x0, bot_y0, X1, bot_y1)  # exact 520px width
 
     # Left: World Map (7 regions colored + pins 13–20)
-    draw_world_map(draw, boxes, map_rect, dispatches)
+    draw_world_map(draw, boxes, map_rect, dispatches, font_log)
 
     # Right: Numbered Dispatch List (Items 13–20)
-    draw.rectangle(list_rect, fill=CARD_BG, outline=CARD_BORDER, width=sx(1))
-    lhdr_h = sx(18)
+    draw.rectangle(list_rect, fill=CARD_BG, outline=CARD_BORDER, width=1)
+    lhdr_h = 18
     draw.rectangle((list_x0, bot_y0, X1, bot_y0 + lhdr_h), fill=DARK_BAR)
     draw_fitted_text(
         draw, boxes, "list_header",
         "NUMBERED DISPATCHES · ITEMS 13–20 · DATELINE, SOURCE & STATUS",
-        load_font(FONT_SANS_BOLD, sx(9)),
-        list_x0 + sx(8), bot_y0, (X1 - list_x0) - sx(16), 1, WHITE,
+        load_font(FONT_SANS_BOLD, 9),
+        list_x0 + 8, bot_y0, (X1 - list_x0) - 16, 1, WHITE,
         align="left", valign="middle", box_h=lhdr_h,
+        font_log=font_log,
     )
 
-    body_y0 = bot_y0 + lhdr_h + sx(2)
-    body_h = (bot_y1 - sx(2)) - body_y0
-    row_h = body_h / len(dispatches)  # ~29.25 logical px per item
+    body_y0 = bot_y0 + lhdr_h + 2
+    body_h = (bot_y1 - 2) - body_y0
+    row_h = body_h / len(dispatches)  # ~31.5px per item
 
-    lnum_font = load_font(FONT_SANS_BOLD, sx(11))
-    ltitle_font = load_font(FONT_SERIF_BOLD, sx(12))
-    lsrc_font = load_font(FONT_SERIF_ITAL, sx(9))
-    lreg_font = load_font(FONT_SANS_CN_BOLD, sx(8))
+    lnum_font = load_font(FONT_SANS_BOLD, 11)
+    ltitle_font = load_font(FONT_SERIF_BOLD, 12)
+    lsrc_font = load_font(FONT_SERIF_ITAL, 9)
+    lreg_font = load_font(FONT_SANS_CN_BOLD, 8)
 
     for i, st in enumerate(dispatches):
         ry0 = body_y0 + int(round(i * row_h))
@@ -1214,13 +1199,13 @@ def build_poster() -> Tuple[Image.Image, Dict[str, int], int]:
         reg_col = REGION_COLORS[st.region]
 
         if i % 2 == 1:
-            draw.rectangle((list_x0 + sx(1), ry0, X1 - sx(1), ry1), fill=(249, 246, 240))
+            draw.rectangle((list_x0 + 1, ry0, X1 - 1, ry1), fill=(249, 246, 240))
         if i > 0:
-            draw.line((list_x0 + sx(6), ry0, X1 - sx(6), ry0), fill=RULE_LIGHT, width=sx(0.75))
+            draw.line((list_x0 + 6, ry0, X1 - 6, ry0), fill=RULE_LIGHT, width=1)
 
         # Number square
-        nsz = sx(21)
-        nx0 = list_x0 + sx(6)
+        nsz = 22
+        nx0 = list_x0 + 6
         ny0 = ry0 + (rh - nsz) // 2
         nbox = (nx0, ny0, nx0 + nsz, ny0 + nsz)
         draw.rectangle(nbox, fill=reg_col)
@@ -1229,13 +1214,13 @@ def build_poster() -> Tuple[Image.Image, Dict[str, int], int]:
             str(st.num), lnum_font,
             nx0, ny0, nsz, 1, WHITE,
             align="center", valign="middle", box_h=nsz,
-            register=False,
+            register=False, font_log=font_log,
         )
         boxes.append((f"list_{st.num}_num", nbox))
 
         # Text column
-        lt_x0 = nx0 + nsz + sx(6)
-        lt_x1 = X1 - sx(6)
+        lt_x0 = nx0 + nsz + 6
+        lt_x1 = X1 - 6
         lt_w = lt_x1 - lt_x0
 
         # Line 1: CITY UPPERCASE + Dark Bold Headline (12px)
@@ -1243,17 +1228,18 @@ def build_poster() -> Tuple[Image.Image, Dict[str, int], int]:
         draw_fitted_text(
             draw, boxes, f"list_{st.num}_title",
             line1_text, ltitle_font,
-            lt_x0, ry0 + sx(2), lt_w, 1, INK_BLACK,
-            align="left", valign="middle", box_h=sx(14),
+            lt_x0, ry0 + 2, lt_w, 1, INK_BLACK,
+            align="left", valign="middle", box_h=15,
+            font_log=font_log,
         )
 
         # Line 2: Region tag + Source (9px italic) on left, Status pill on right
         st_col = STATUS_COLORS[st.status]
         st_tw = _text_width(st.status, status_font)
-        pw = st_tw + sx(8)
-        ph = sx(10)
+        pw = st_tw + 8
+        ph = 11
         px0 = lt_x1 - pw
-        py0 = ry0 + sx(17)
+        py0 = ry0 + 18
         prect = (px0, py0, lt_x1, py0 + ph)
         draw.rectangle(prect, fill=st_col)
         draw_fitted_text(
@@ -1261,34 +1247,36 @@ def build_poster() -> Tuple[Image.Image, Dict[str, int], int]:
             st.status, status_font,
             px0, py0, pw, 1, WHITE,
             align="center", valign="middle", box_h=ph,
-            register=False,
+            register=False, font_log=font_log,
         )
         boxes.append((f"list_{st.num}_status", prect))
 
         # Region label
-        reg_w = _text_width(st.region, lreg_font) + sx(1)
+        reg_w = _text_width(st.region, lreg_font) + 2
         draw_fitted_text(
             draw, boxes, f"list_{st.num}_region",
             st.region, lreg_font,
             lt_x0, py0, reg_w, 1, reg_col,
             align="left", valign="middle", box_h=ph,
+            font_log=font_log,
         )
 
         # Source (9px italic)
-        src_x0 = lt_x0 + reg_w + sx(3)
-        src_w = (px0 - sx(6)) - src_x0
+        src_x0 = lt_x0 + reg_w + 3
+        src_w = (px0 - 6) - src_x0
         draw_fitted_text(
             draw, boxes, f"list_{st.num}_source",
             f"· Source: {st.source}", lsrc_font,
             src_x0, py0, src_w, 1, INK_MUTED,
             align="left", valign="middle", box_h=ph,
+            font_log=font_log,
         )
 
     # =========================================================================
-    # 8. BOTTOM DATE CHECK BAR (y = 974..1000, deep black bar, white 9px)
+    # 8. BOTTOM DATE CHECK BAR (y = 996..1024, deep black bar, white 9px)
     # =========================================================================
-    dc_y0 = sx(974)
-    dc_h = CANVAS_H - dc_y0  # 26 logical px = 104 physical px
+    dc_y0 = 996
+    dc_h = CANVAS_H - dc_y0  # 28px
     draw.rectangle((0, dc_y0, CANVAS_W, CANVAS_H), fill=DARK_BAR)
     dc_text = (
         "DATE CHECK — 2026-11-22 ONLY: STRICTLY LIMITED TO SUNDAY 22 NOVEMBER 2026 EVENTS · "
@@ -1298,14 +1286,15 @@ def build_poster() -> Tuple[Image.Image, Dict[str, int], int]:
     draw_fitted_text(
         draw, boxes, "date_check",
         dc_text,
-        load_font(FONT_SANS_CN_BOLD, sx(9)),
+        load_font(FONT_SANS_CN_BOLD, 9),
         X0, dc_y0, CW, 1, WHITE,
         align="center", valign="middle", box_h=dc_h,
+        font_log=font_log,
     )
 
     # Run mandatory global pairwise collision check across ALL registered blocks
     pairs_checked = no_overlap(boxes)
-    return img, region_counts, pairs_checked
+    return img, region_counts, pairs_checked, font_log
 
 
 def file_md5(path: str) -> str:
@@ -1317,27 +1306,35 @@ def file_md5(path: str) -> str:
 
 
 def main() -> None:
-    img, region_counts, pairs_checked = build_poster()
+    img, region_counts, pairs_checked, font_log = build_poster()
+
+    if img.size != (CANVAS_W, CANVAS_H):
+        raise RuntimeError(f"Expected {CANVAS_W}x{CANVAS_H}, got {img.size}")
 
     # Save deterministic PNG (no timestamps/metadata, optimize=True)
     img.save(OUT_MAIN, format="PNG", optimize=True, compress_level=9)
     size_bytes = os.path.getsize(OUT_MAIN)
     if size_bytes > MAX_PNG_BYTES:
         raise RuntimeError(
-            f"entry.png exceeds 8MB SPEC cap: {size_bytes} bytes > {MAX_PNG_BYTES}"
+            f"entry.png exceeds 1 MiB gate cap: {size_bytes} bytes > {MAX_PNG_BYTES}"
         )
 
-    # Generate 300x300 preview proportionally downscaled from 4000x4000 master
+    # Generate 300x300 preview proportionally downscaled from 1024x1024 master
     preview = img.resize((300, 300), Image.Resampling.LANCZOS)
     preview.save(OUT_PREVIEW, format="PNG", optimize=True, compress_level=9)
 
     counts_str = " · ".join(f"{r} {region_counts[r]}" for r in REGION_ORDER)
+    shrunk = [(lbl, req, act, lns) for (lbl, req, act, lns) in font_log if act < req]
     print(f"Stories: {len(STORIES)} (12 cards + 8 list items)")
     print(f"Regions: {counts_str} (sum={sum(region_counts.values())})")
-    print(f"Master:  {img.size[0]}x{img.size[1]}, {size_bytes:,} bytes ({size_bytes / (1024*1024):.2f} MiB)")
+    print(f"Master:  {img.size[0]}x{img.size[1]}, {size_bytes:,} bytes ({size_bytes / (1024*1024):.3f} MiB)")
     print(f"MD5:     {file_md5(OUT_MAIN)}")
     print(f"Preview: 300x300, {os.path.getsize(OUT_PREVIEW):,} bytes, md5={file_md5(OUT_PREVIEW)}")
     print(f"Overlap: 0 collisions across {pairs_checked:,} box pairs")
+    if shrunk:
+        print(f"Shrunk ({len(shrunk)}): " + ", ".join(f"{l}:{r}->{a}px" for l, r, a, _ in shrunk))
+    else:
+        print("Shrunk:  none (all text rendered at requested SPEC px)")
 
 
 if __name__ == "__main__":
